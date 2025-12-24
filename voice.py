@@ -268,11 +268,29 @@ class GrievanceBotLogic:
         print(f"Text preview: {self.grievance_text[:100]}...")
         print(f"{'='*60}\n")
         
-        # Schedule async processing
-        asyncio.create_task(self._process_grievance())
+        # Process in background - don't block the closing message
+        asyncio.create_task(self._process_grievance_background())
         
         self.state = "closing"
         self.should_disconnect = True
+    
+    async def _process_grievance_background(self):
+        """Process grievance in background without blocking exit."""
+        try:
+            print("[BACKGROUND] Starting grievance processing...")
+            result = await grievance_processor.process_and_store(
+                transcript=self.grievance_text,
+                timestamp=self.grievance_timestamp or time.time()
+            )
+            
+            print(f"\n{'='*60}")
+            print(f"[SUCCESS] Grievance processed and stored")
+            print(f"ID: {result.get('id', 'N/A')}")
+            print(f"Summary: {result.get('summary', 'N/A')[:100]}...")
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to process grievance: {e}")
     
     async def _process_grievance(self):
         """Process grievance with LLM and store in database."""
@@ -326,11 +344,12 @@ async def entrypoint(ctx: JobContext):
                 if audio_key:
                     await player.play(AUDIO_FILES[audio_key])
                     
-                if bot.should_disconnect:
-                    await asyncio.sleep(2)
-                    print("Disconnecting...")
-                    await ctx.room.disconnect()
-                    break
+                    if audio_key == "closing":
+                        print("[CLOSING] Playing farewell message...")
+                        await asyncio.sleep(1.0)  # Brief pause after closing audio finishes
+                        print("[CLOSING] Disconnecting from room...")
+                        await ctx.room.disconnect()
+                        break
     
     asyncio.create_task(process_stt_events())
 
