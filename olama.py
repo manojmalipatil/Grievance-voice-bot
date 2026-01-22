@@ -4,6 +4,7 @@ import sqlite3
 import uuid
 import json
 import logging
+from typing import Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -18,7 +19,8 @@ from livekit.agents import (
     cli,
     function_tool,
 )
-from livekit.plugins import sarvam, openai, silero, groq
+# Added 'openai' to imports for Ollama support
+from livekit.plugins import sarvam, groq, silero, openai 
 
 load_dotenv()
 
@@ -28,17 +30,16 @@ logger = logging.getLogger("GrievanceBot")
 
 # --- Load Language Configuration ---
 def load_language_config(config_path="language_config.json"):
-    """Load language configuration from JSON file."""
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        print(f"[CONFIG] Successfully loaded language config from {config_path}")
+        logger.info(f"[CONFIG] Successfully loaded language config from {config_path}")
         return config
     except FileNotFoundError:
-        print(f"[ERROR] Config file not found: {config_path}")
+        logger.error(f"[ERROR] Config file not found: {config_path}")
         raise
     except json.JSONDecodeError as e:
-        print(f"[ERROR] Invalid JSON in config file: {e}")
+        logger.error(f"[ERROR] Invalid JSON in config file: {e}")
         raise
 
 LANGUAGE_CONFIG = load_language_config()
@@ -46,7 +47,7 @@ SUPPORTED_LANGUAGES = LANGUAGE_CONFIG["supported_languages"]
 LANGUAGE_SELECTION_PROMPT = LANGUAGE_CONFIG["language_selection_prompt"]
 GRIEVANCE_PROMPTS = LANGUAGE_CONFIG["grievance_prompts"]
 
-# --- Database Manager (Async Wrapper) ---
+# --- Database Manager ---
 class DatabaseManager:
     def __init__(self, db_path="grievance.db"):
         self.db_path = db_path
@@ -54,7 +55,6 @@ class DatabaseManager:
         self.init_db()
 
     def init_db(self):
-        """Initialize the database table synchronously at startup."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("""
@@ -71,8 +71,8 @@ class DatabaseManager:
         conn.close()
 
     async def save_grievance(self, transcript: str, language: str = "en"):
-        """Save the transcript asynchronously to avoid blocking voice loop."""
         if not transcript.strip():
+            logger.warning("[DB] Attempted to save empty grievance, skipping")
             return
 
         def _save():
@@ -92,89 +92,171 @@ class DatabaseManager:
             finally:
                 conn.close()
 
-        # Run blocking SQL in a separate thread
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._executor, _save)
 
 
 class GrievanceTracker:
-    """Track grievance conversation."""
     def __init__(self):
         self.grievance_text = []
-        self.conversation_history = []
         self.selected_language = None
     
     def set_language(self, language_code: str):
         self.selected_language = language_code
+        logger.info(f"[TRACKER] Language set to: {language_code}")
     
     def add_user_message(self, text: str):
         self.grievance_text.append(f"Employee: {text}")
-        self.conversation_history.append({"role": "user", "content": text})
     
     def add_agent_message(self, text: str):
         self.grievance_text.append(f"Agent: {text}")
-        self.conversation_history.append({"role": "assistant", "content": text})
     
     def get_full_grievance(self) -> str:
         return "\n".join(self.grievance_text)
+    
+    def reset(self):
+        """Reset tracker for new conversation"""
+        self.grievance_text = []
+        logger.info("[TRACKER] Reset grievance text")
 
 
 async def entrypoint(ctx: JobContext):
     logger.info(f"[ROOM] Connecting to room: {ctx.room.name}")
+    
+    # Verify Groq API key
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        logger.error("[ERROR] GROQ_API_KEY not found in environment variables!")
+        raise ValueError("GROQ_API_KEY is required. Add it to your .env file")
     
     db_manager = DatabaseManager()
     await ctx.connect()
     
     grievance_tracker = GrievanceTracker()
     
-    # State flags
+    # State management
     should_end_call = asyncio.Event()
     language_selected = asyncio.Event()
     selected_lang_code = "en"
+    tool_called = {"called": False}
     
-    # --- 1. THE SILENT TOOL ---
+    # --- LANGUAGE SELECTION TOOL ---
     @function_tool
-    async def select_language(language: str):
+    async def select_language(language: Optional[str] = None):
         """
-        Select the language. Call this immediately when the user answers.
+        Select the language based on user preference. 
+        Call this immediately after user states their preference.
+        
+        Args:
+            language: The language name the user mentioned (e.g., "english", "hindi", "tamil", "kannada", etc.).
+                     IMPORTANT: Use the EXACT language the user mentioned, not a default!
         """
         nonlocal selected_lang_code
-        lang_lower = language.lower().strip()
         
-        # Logic to find code
-        found_code = "en"
+        if language is None or not language.strip():
+            logger.warning("[TOOL] LLM passed None/empty for language. Defaulting to English.")
+            language = "english"
+
+        lang_lower = language.lower().strip()
+        logger.info(f"[TOOL] Received language selection: '{lang_lower}'")
+        
+        # Find matching language code with improved matching
+        found_code = None
+        found_name = "English"
+        
+        # First: Try exact match on language name (english, hindi, tamil, kannada, etc.)
         for name, data in SUPPORTED_LANGUAGES.items():
-            if name in lang_lower:
+            if name.lower() == lang_lower:
                 found_code = data["code"]
+                found_name = data["name"]
+                logger.info(f"[TOOL] Exact match: '{lang_lower}' → {found_name} ({found_code})")
                 break
+        
+        # Second: Try partial match (if user said "I want kannada")
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                if name.lower() in lang_lower or lang_lower in name.lower():
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Partial match: '{lang_lower}' contains {name} → {found_name} ({found_code})")
+                    break
+        
+        # Third: Try matching native script
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                native_name = data["name"].lower()
+                if native_name in lang_lower or lang_lower in native_name:
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Native script match: '{lang_lower}' → {found_name} ({found_code})")
+                    break
+        
+        # Fourth: Try by language code (en, hi, kn, etc.)
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                if data["code"] == lang_lower:
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Code match: '{lang_lower}' → {found_name} ({found_code})")
+                    break
+        
+        # Last resort: Default to English
+        if found_code is None:
+            logger.warning(f"[TOOL] No match found for '{lang_lower}', defaulting to English")
+            found_code = "en"
+            found_name = "English"
         
         selected_lang_code = found_code
         grievance_tracker.set_language(selected_lang_code)
+        tool_called["called"] = True
         
-        # Trigger the main loop to kill this session
+        logger.info(f"[TOOL] Language finalized: {found_name} ({selected_lang_code})")
         language_selected.set()
         
-        return "TERMINATE_SESSION" 
+        return ""  # Empty to prevent speaking
 
+    # --- END CALL TOOL ---
     @function_tool
     async def end_call(confirmation: str = "yes"):
+        """
+        End the grievance collection call.
+        Call this only when the user explicitly indicates they are done.
+        """
+        logger.info(f"[TOOL] end_call triggered")
         should_end_call.set()
-        return "Call ending initiated."
+        return ""
 
-    # --- STAGE 1: SELECTION AGENT ---
-    logger.info("[START] Stage 1: Language Selection")
+    # ============================================================================
+    # STAGE 1: LANGUAGE SELECTION
+    # ============================================================================
+    logger.info("[STAGE 1] Starting Language Selection Phase")
+    
+    # OPTIMIZED VAD SETTINGS
+    vad_config_stage1 = silero.VAD.load(
+        min_speech_duration=0.1,       # Reduced to catch speech faster
+        min_silence_duration=0.5,      # Reasonable pause detection
+        activation_threshold=0.5,      # Moderate threshold
+        sample_rate=16000,
+    )
+    
+    # GROQ LLM - LLAMA 3.1 8B INSTANT (Fast & Efficient)
+    # This model is extremely fast and great for simple tasks like language selection
+    llm_config_stage1 = groq.LLM(
+        model="llama-3.1-8b-instant",  # Production model, super fast
+        temperature=0.3,  # Low temperature for deterministic responses
+    )
     
     session_1 = AgentSession(
-        vad=silero.VAD.load(
-            min_speech_duration=0.3,
-            min_silence_duration=0.5,
+        vad=vad_config_stage1,
+        stt=groq.STT(
+            model="whisper-large-v3-turbo"
+            #language="en"  # Always listen in English for language selection
         ),
-        stt=groq.STT(model="whisper-large-v3-turbo", language="en"),  # Groq Whisper for STT
-        llm=openai.LLM.with_ollama(
-            model="qwen2.5:7b",
-            base_url="http://localhost:11434/v1",
-        ),  # Local Ollama LLM
-        tts=sarvam.TTS(target_language_code="en-IN", speaker="anushka"),
+        llm=llm_config_stage1,
+        tts=sarvam.TTS(
+            target_language_code="en-IN", 
+            speaker="anushka"
+        ),
     )
     
     language_agent = Agent(
@@ -182,67 +264,109 @@ async def entrypoint(ctx: JobContext):
         tools=[select_language],
     )
 
-    # Start Session 1
-    task_1 = asyncio.create_task(session_1.start(agent=language_agent, room=ctx.room))
-    
-    # Initial Greeting
-    await asyncio.sleep(1.0)
-    await session_1.generate_reply(
-        instructions="Ask the user if they prefer English, Hindi, or Tamil."
-    )
+    # Event listener for debugging
+    @session_1.on("conversation_item_added")
+    def on_item_stage1(event):
+        if event.item.text_content:
+            logger.info(f"[STAGE 1] {event.item.role}: {event.item.text_content}")
 
-    # Wait for the tool to be called
+    # Start session - this begins listening immediately
+    session_1_task = asyncio.create_task(
+        session_1.start(agent=language_agent, room=ctx.room)
+    )
+    
+    # Wait for session to fully initialize
+    logger.info("[STAGE 1] Waiting for session to initialize...")
+    await asyncio.sleep(1)  # Increased wait time for full initialization
+    
+    # Send initial greeting without blocking listening
+    logger.info("[STAGE 1] Sending initial greeting...")
+    try:
+        # Use say() instead of generate_reply() to avoid blocking the conversation flow
+        await session_1.say(
+            "Hello! Which language would you like to speak? We support English, Hindi, Tamil, Kannada, Telugu, Bengali, Marathi, Gujarati, Malayalam, Punjabi, and Odia.",
+            allow_interruptions=True,  # Allow user to interrupt
+        )
+        logger.info("[STAGE 1] ✓ Greeting sent, now listening...")
+    except Exception as e:
+        logger.error(f"[STAGE 1] Error sending greeting: {e}")
+        # Continue anyway, the agent should still work
+    
+    # Wait for language selection
+    logger.info("[STAGE 1] Waiting for language selection...")
     try:
         await asyncio.wait_for(language_selected.wait(), timeout=60.0)
+        logger.info(f"[STAGE 1] ✓ Language selected: {selected_lang_code}")
     except asyncio.TimeoutError:
+        logger.warning("[STAGE 1] ⚠ Timeout - defaulting to English")
         selected_lang_code = "en"
-
-    # --- 2. PROPER SESSION SHUTDOWN ---
-    logger.info("[SHUTDOWN] Stopping language selection agent...")
+        grievance_tracker.set_language(selected_lang_code)
     
-    # Step 1: Stop the session (this is the key missing piece!)
+    if not tool_called["called"]:
+        logger.warning("[STAGE 1] ⚠ Tool was never called")
+    
+    # ============================================================================
+    # GRACEFUL SESSION 1 SHUTDOWN
+    # ============================================================================
+    logger.info("[TRANSITION] Shutting down language selection...")
+    
     try:
         await session_1.aclose()
-        logger.info("[SHUTDOWN] Session 1 closed successfully")
+        logger.info("[TRANSITION] ✓ Session 1 closed")
     except Exception as e:
-        logger.error(f"[SHUTDOWN] Error closing session 1: {e}")
+        logger.error(f"[TRANSITION] Error closing session 1: {e}")
     
-    # Step 2: Cancel the task
-    task_1.cancel()
+    session_1_task.cancel()
     try:
-        await task_1
+        await session_1_task
     except asyncio.CancelledError:
-        logger.info("[SHUTDOWN] Task 1 cancelled")
+        logger.info("[TRANSITION] ✓ Session 1 task cancelled")
     
-    # Step 3: Cleanup reference
-    del session_1
-    del language_agent
+    # CRITICAL BUFFER - Allow audio to drain
+    logger.info(f"[TRANSITION] Audio buffer flush ({selected_lang_code})...")
+    await asyncio.sleep(0.5)
     
-    # Step 4: CRITICAL BUFFER FLUSH
-    logger.info(f"[TRANSITION] Flushing audio buffers... switching to {selected_lang_code}")
-    await asyncio.sleep(2.5)  # Increased slightly for safety
+    # ============================================================================
+    # STAGE 2: GRIEVANCE COLLECTION
+    # ============================================================================
+    logger.info("[STAGE 2] Starting Grievance Collection Phase")
 
-    # --- STAGE 2: GRIEVANCE AGENT ---
-    logger.info("[START] Stage 2: Grievance Collection")
-
-    # Get the specific prompt for the language
     prompt = GRIEVANCE_PROMPTS.get(selected_lang_code, GRIEVANCE_PROMPTS["en"])
     
-    # Lookup TTS code
+    # Get TTS code
     tts_code = "en-IN"
     for lang_data in SUPPORTED_LANGUAGES.values():
         if lang_data["code"] == selected_lang_code:
             tts_code = lang_data["sarvam_tts_code"]
+            logger.info(f"[STAGE 2] Using TTS code: {tts_code}")
             break
 
+    # OPTIMIZED VAD for Stage 2
+    vad_config_stage2 = silero.VAD.load(
+        min_speech_duration=0.5,
+        min_silence_duration=0.8,
+        activation_threshold=0.5,
+        sample_rate=16000,
+    )
+    
+    # --- CHANGED: OLLAMA LLM (via OpenAI Plugin) ---
+    # Replaced Groq with OpenAI plugin pointing to local Ollama
+    llm_config_stage2 = groq.LLM(
+        model="openai/gpt-oss-120b",  # Production model, super fast
+        temperature=0.3,  # Low temperature for deterministic responses
+    )
+
     session_2 = AgentSession(
-        vad=silero.VAD.load(),
-        stt=groq.STT(model="whisper-large-v3-turbo", language=selected_lang_code),  # Groq Whisper
-        llm=openai.LLM.with_ollama(
-            model="qwen2.5:7b",
-            base_url="http://localhost:11434/v1",
-        ),  # Local Ollama LLM
-        tts=sarvam.TTS(target_language_code=tts_code, speaker="anushka"),
+        vad=vad_config_stage2,
+        stt=groq.STT(
+            model="whisper-large-v3-turbo", 
+            language=selected_lang_code
+        ),
+        llm=llm_config_stage2,
+        tts=sarvam.TTS(
+            target_language_code=tts_code, 
+            speaker="anushka"
+        ),
     )
 
     grievance_agent = Agent(
@@ -250,44 +374,66 @@ async def entrypoint(ctx: JobContext):
         tools=[end_call],
     )
     
-    # Event Hook for Session 2 (Logging)
+    # Track conversation
     @session_2.on("conversation_item_added")
-    def on_item_added_2(event):
+    def on_item_stage2(event):
         if event.item.text_content:
+            logger.info(f"[STAGE 2] {event.item.role}: {event.item.text_content}")
             if event.item.role == "user":
                 grievance_tracker.add_user_message(event.item.text_content)
             elif event.item.role == "assistant":
                 grievance_tracker.add_agent_message(event.item.text_content)
 
-    task_2 = asyncio.create_task(session_2.start(agent=grievance_agent, room=ctx.room))
+    session_2_task = asyncio.create_task(
+        session_2.start(agent=grievance_agent, room=ctx.room)
+    )
     
-    # Trigger the greeting immediately
-    await session_2.generate_reply()
+    # Warmup period
+    logger.info("[STAGE 2] Session warmup...")
+    await asyncio.sleep(1)
+    
+    # Generate greeting
+    try:
+        await session_2.generate_reply()
+        logger.info("[STAGE 2] ✓ Initial greeting sent")
+    except asyncio.TimeoutError:
+        logger.error("[STAGE 2] ⚠ Timeout generating greeting")
+    except Exception as e:
+        logger.error(f"[STAGE 2] Error: {e}")
 
-    # Wait for the end
+    # Wait for completion
+    logger.info("[STAGE 2] Collecting grievance...")
     await should_end_call.wait()
     
-    # Cleanup Session 2
-    logger.info("[SHUTDOWN] Ending grievance collection...")
-    await asyncio.sleep(1.0)
+    # ============================================================================
+    # CLEANUP & SAVE
+    # ============================================================================
+    logger.info("[CLEANUP] Ending session...")
+    await asyncio.sleep(3.0)
     
     try:
         await session_2.aclose()
+        logger.info("[CLEANUP] ✓ Session 2 closed")
     except Exception as e:
-        logger.error(f"[SHUTDOWN] Error closing session 2: {e}")
+        logger.error(f"[CLEANUP] Error: {e}")
     
-    task_2.cancel()
+    session_2_task.cancel()
     try:
-        await task_2
+        await session_2_task
     except asyncio.CancelledError:
-        pass
+        logger.info("[CLEANUP] ✓ Session 2 task cancelled")
     
-    # Save to DB
+    # Save to database
     full_log = grievance_tracker.get_full_grievance()
-    await db_manager.save_grievance(full_log, selected_lang_code)
+    if full_log.strip():
+        logger.info(f"[CLEANUP] Saving {len(full_log)} chars to DB")
+        await db_manager.save_grievance(full_log, selected_lang_code)
+    else:
+        logger.warning("[CLEANUP] ⚠ No content to save")
     
     await ctx.disconnect()
-    logger.info("[END] Disconnected from room")
+    logger.info("[END] ✓ Session complete")
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
