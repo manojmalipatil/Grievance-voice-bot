@@ -1,52 +1,64 @@
 import sqlite3
 import json
 import requests
-from google.cloud import translate_v2
 from datetime import datetime
 
+# =========================
 # Configuration
-DB_PATH = r'c:\Users\ISFL-RT000265\Desktop\process\grievance.db'
+# =========================
+DB_PATH = "grievance.db"
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "deepseek-r1:14b"  # You can change this to your preferred model (llama2, neural-chat, etc.)
+OLLAMA_MODEL = "deepseek-r1:14b"
 
-# Initialize Google Translate client (requires credentials)
-try:
-    translate_client = translate_v2.Client()
-    TRANSLATE_AVAILABLE = True
-except Exception as e:
-    print(f"Warning: Google Translate not available ({e}). Will attempt fallback.")
-    TRANSLATE_AVAILABLE = False
+# Initialize Translator
+TRANSLATE_AVAILABLE = True
 
 
+# =========================
+# Translation Function
+# =========================
 def translate_to_english(text, language):
-    """Translate text to English using Google Translate or fallback method."""
+    """Translate text to English using LibreTranslate."""
     if not text:
         return text
-    
-    if language.lower() == 'en' or language.lower() == 'english':
+
+    if language and language.lower() in ['en', 'english']:
         return text
-    
+
     try:
-        if TRANSLATE_AVAILABLE:
-            result = translate_client.translate_text(text)
-            return result['translatedText']
+        response = requests.post(
+            "https://libretranslate.com/translate",
+            json={
+                "q": text,
+                "source": "auto",
+                "target": "en",
+                "format": "text"
+            },
+            timeout=30
+        )
+
+        if response.status_code == 200:
+            return response.json().get("translatedText", text)
+
+        print("LibreTranslate failed, returning original text")
+        return text
+
     except Exception as e:
         print(f"Translation error: {e}")
-    
-    # If translation fails, return original text
-    print(f"Warning: Could not translate from {language}. Returning original text.")
-    return text
+        return text
 
 
+
+# =========================
+# Database Schema Update
+# =========================
 def ensure_columns_exist(conn):
     """Ensure all required columns exist in the grievances table."""
     cursor = conn.cursor()
-    
-    # Get existing columns
+
     cursor.execute("PRAGMA table_info(grievances)")
     existing_columns = {row[1] for row in cursor.fetchall()}
-    
-    # Define new columns to add
+
     new_columns = {
         'translated_transcript': 'TEXT',
         'category': 'TEXT',
@@ -58,22 +70,22 @@ def ensure_columns_exist(conn):
         'processed_at': 'TEXT',
         'analysis_json': 'TEXT'
     }
-    
-    # Add missing columns
+
     for col_name, col_type in new_columns.items():
         if col_name not in existing_columns:
-            try:
-                cursor.execute(f"ALTER TABLE grievances ADD COLUMN {col_name} {col_type}")
-                print(f"Added column: {col_name}")
-            except sqlite3.OperationalError as e:
-                print(f"Column {col_name} already exists or error: {e}")
-    
+            cursor.execute(f"ALTER TABLE grievances ADD COLUMN {col_name} {col_type}")
+            print(f"Added column: {col_name}")
+
     conn.commit()
 
 
+# =========================
+# Ollama Interaction
+# =========================
 def send_to_ollama(transcript):
-    """Send transcript to Ollama for analysis."""
-    prompt = f"""Analyze this customer grievance and provide a structured categorization.
+    """Send transcript to Ollama for structured grievance analysis."""
+    prompt = f"""
+Analyze this customer grievance and provide a structured categorization.
 
 Grievance transcript:
 "{transcript}"
@@ -87,7 +99,7 @@ Please provide:
 6. Location (Extract specific branch, city, or office. If NOT found, return "Undisclosed Location")
 7. Department (Extract specific department e.g., Sales, IT, HR, Logistics. If NOT found, return "General")
 
-Respond strictly in VALID JSON format without markdown code blocks:
+Respond strictly in VALID JSON format without markdown:
 {{
     "category": "...",
     "priority": "...",
@@ -96,8 +108,9 @@ Respond strictly in VALID JSON format without markdown code blocks:
     "tags": ["tag1", "tag2"],
     "location": "...",
     "department": "..."
-}}"""
-    
+}}
+"""
+
     try:
         response = requests.post(
             OLLAMA_API_URL,
@@ -109,104 +122,81 @@ Respond strictly in VALID JSON format without markdown code blocks:
             },
             timeout=300
         )
-        
+
         if response.status_code == 200:
-            result = response.json()
-            return result.get('response', '')
+            return response.json().get("response", "")
         else:
             print(f"Ollama API error: {response.status_code}")
             return None
+
     except Exception as e:
         print(f"Error connecting to Ollama: {e}")
-        print("Make sure Ollama is running locally on port 11434")
+        print("Ensure Ollama is running on http://localhost:11434")
         return None
 
 
+# =========================
+# Parse Ollama JSON Output
+# =========================
 def parse_ollama_response(response_text):
-    """Parse JSON response from Ollama."""
+    """Extract and parse JSON from Ollama response."""
     try:
-        # Find JSON content in the response
-        start_idx = response_text.find('{')
-        end_idx = response_text.rfind('}') + 1
-        
-        if start_idx != -1 and end_idx > start_idx:
-            json_str = response_text[start_idx:end_idx]
-            return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse JSON response: {e}")
-        print(f"Response: {response_text}")
-    
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        if start != -1 and end > start:
+            return json.loads(response_text[start:end])
+    except Exception as e:
+        print(f"JSON parsing failed: {e}")
+        print("Raw response:", response_text)
+
     return None
 
 
+# =========================
+# Main Processing Logic
+# =========================
 def process_grievances():
-    """Main function to process pending grievances."""
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        # Ensure all columns exist
+
         ensure_columns_exist(conn)
-        
-        # Get all pending grievances
+
         cursor.execute("""
-            SELECT id, transcript, language, location 
-            FROM grievances 
+            SELECT id, transcript, language, location
+            FROM grievances
             WHERE status = 'pending'
         """)
-        
-        pending_grievances = cursor.fetchall()
-        print(f"Found {len(pending_grievances)} pending grievances to process")
-        
-        if not pending_grievances:
-            print("No pending grievances found.")
-            conn.close()
-            return
-        
-        # Process each grievance
-        for idx, (grievance_id, transcript, language, location) in enumerate(pending_grievances, 1):
-            print(f"\n{'='*60}")
-            print(f"Processing grievance {idx}/{len(pending_grievances)} (ID: {grievance_id})")
-            print(f"{'='*60}")
-            
-            # Step 1: Translate to English
-            print(f"Original language: {language}")
-            translated_transcript = translate_to_english(transcript, language)
-            print(f"Translation complete")
-            
-            # Step 2: Send to Ollama for analysis
-            print("Sending to Ollama for analysis...")
-            ollama_response = send_to_ollama(translated_transcript)
-            
-            if not ollama_response:
-                print(f"Failed to get response from Ollama for ID {grievance_id}")
+        grievances = cursor.fetchall()
+
+        print(f"Found {len(grievances)} pending grievances")
+
+        for idx, (gid, transcript, language, location) in enumerate(grievances, 1):
+            print("\n" + "=" * 60)
+            print(f"Processing {idx}/{len(grievances)} | ID: {gid}")
+            print("=" * 60)
+
+            translated_text = translate_to_english(transcript, language)
+            print("✓ Translation complete")
+
+            ollama_output = send_to_ollama(translated_text)
+            if not ollama_output:
+                print("✗ Ollama failed")
                 continue
-            
-            # Step 3: Parse response
-            print("Parsing analysis results...")
-            analysis = parse_ollama_response(ollama_response)
-            
+
+            analysis = parse_ollama_response(ollama_output)
             if not analysis:
-                print(f"Failed to parse analysis for ID {grievance_id}")
+                print("✗ Invalid Ollama JSON")
                 continue
-            
-            # Display results
-            print("\nAnalysis Results:")
-            print(f"  Category: {analysis.get('category', 'N/A')}")
-            print(f"  Priority: {analysis.get('priority', 'N/A')}")
-            print(f"  Sentiment: {analysis.get('sentiment', 'N/A')}")
-            print(f"  Summary: {analysis.get('summary', 'N/A')}")
-            print(f"  Tags: {', '.join(analysis.get('tags', []))}")
-            print(f"  Location: {analysis.get('location', 'N/A')}")
-            print(f"  Department: {analysis.get('department', 'N/A')}")
-            
-            # Step 4: Update database
-            processed_at = datetime.now().isoformat()
-            tags_str = ','.join(analysis.get('tags', []))
-            
+
+            print("✓ Analysis successful")
+            print(f"  Category: {analysis.get('category')}")
+            print(f"  Priority: {analysis.get('priority')}")
+            print(f"  Sentiment: {analysis.get('sentiment')}")
+
             cursor.execute("""
-                UPDATE grievances 
-                SET translated_transcript = ?,
+                UPDATE grievances SET
+                    translated_transcript = ?,
                     category = ?,
                     priority = ?,
                     sentiment = ?,
@@ -218,40 +208,37 @@ def process_grievances():
                     status = 'completed'
                 WHERE id = ?
             """, (
-                translated_transcript,
-                analysis.get('category', ''),
-                analysis.get('priority', ''),
-                analysis.get('sentiment', ''),
-                analysis.get('summary', ''),
-                tags_str,
-                analysis.get('department', ''),
-                processed_at,
+                translated_text,
+                analysis.get("category", ""),
+                analysis.get("priority", ""),
+                analysis.get("sentiment", ""),
+                analysis.get("summary", ""),
+                ",".join(analysis.get("tags", [])),
+                analysis.get("department", ""),
+                datetime.now().isoformat(),
                 json.dumps(analysis),
-                grievance_id
+                gid
             ))
-            
+
             conn.commit()
-            print(f"✓ Grievance {grievance_id} processed and updated in database")
-        
-        print(f"\n{'='*60}")
-        print(f"Processing complete! {len(pending_grievances)} grievances processed.")
-        print(f"{'='*60}")
-        
+            print(f"✓ Grievance {gid} updated")
+
         conn.close()
-    
+        print("\nALL GRIEVANCES PROCESSED SUCCESSFULLY")
+
     except Exception as e:
-        print(f"Error processing grievances: {e}")
-        if conn:
-            conn.close()
+        print(f"Fatal error: {e}")
 
 
+# =========================
+# Entry Point
+# =========================
 if __name__ == "__main__":
     print("Grievance Processing System")
-    print("="*60)
-    print("This script will:")
-    print("1. Translate transcripts to English")
-    print("2. Send to Ollama for analysis")
-    print("3. Store results in database")
-    print("="*60)
-    
+    print("=" * 60)
+    print("• Auto-translation")
+    print("• Ollama-based analysis")
+    print("• SQLite persistence")
+    print("=" * 60)
+
     process_grievances()
