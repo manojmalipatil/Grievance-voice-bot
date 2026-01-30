@@ -1,349 +1,466 @@
 import asyncio
 import os
-import time
-import av
+import sqlite3
+import uuid
+import json
+import logging
+from typing import Optional
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-import random
 
 # LiveKit Imports
 from livekit import agents, rtc
-from livekit.agents import JobContext, WorkerOptions, cli, AutoSubscribe, stt
-from livekit.plugins import deepgram
-
-# Import our grievance processor
-from grievance_processor import GrievanceProcessor
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    JobContext,
+    WorkerOptions,
+    cli,
+    function_tool,
+)
+# Added 'openai' to imports for Ollama support
+from livekit.plugins import sarvam, groq, silero, openai, noise_cancellation  
 
 load_dotenv()
 
-# --- CONFIGURATION ---
-AUDIO_FILES = {
-    "greeting": "audio/greeting_new.mp3",
-    "closing": "audio/closing_new.mp3",
-    "early_exit": "audio/early_closing.mp3",
-    "probe_details": "audio/probe_details_short.mp3",
-    "ack_1": "audio/hmm.mp3",
-    "ack_2": "audio/i_see.mp3",
-    "ack_3": "audio/ohh_isit.mp3"
-}
+# --- Logging Setup ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("GrievanceBot")
 
-SAMPLE_RATE = 48000
-NUM_CHANNELS = 1
-FRAME_SIZE_SAMPLES = 480
+# --- Load Language Configuration ---
+def load_language_config(config_path="language_config.json"):
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        logger.info(f"[CONFIG] Successfully loaded language config from {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"[ERROR] Config file not found: {config_path}")
+        raise
+    except json.JSONDecodeError as e:
+        logger.error(f"[ERROR] Invalid JSON in config file: {e}")
+        raise
 
-# Initialize the grievance processor
-grievance_processor = GrievanceProcessor(db_path="grievances.db")
+LANGUAGE_CONFIG = load_language_config()
+SUPPORTED_LANGUAGES = LANGUAGE_CONFIG["supported_languages"]
+LANGUAGE_SELECTION_PROMPT = LANGUAGE_CONFIG["language_selection_prompt"]
+GRIEVANCE_PROMPTS = LANGUAGE_CONFIG["grievance_prompts"]
 
-class AudioFilePlayer:
-    def __init__(self, source: rtc.AudioSource):
-        self.source = source
-        self._current_task = None
-        self.is_playing = False
-        self._cache = {}
+# --- Database Manager ---
+class DatabaseManager:
+    def __init__(self, db_path="grievance.db"):
+        self.db_path = db_path
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self.init_db()
 
-    def preload(self, files_dict):
-        """Pre-decode short audio files into memory."""
-        print("[INIT] Pre-loading short audio files...")
-        for key, path in files_dict.items():
-            if "ack" in key or "greeting" in key: 
-                try:
-                    self._cache[path] = list(self._decode_file(path))
-                    print(f"   -> Cached {path}")
-                except Exception as e:
-                    print(f"   -> Failed to cache {path}: {e}")
-
-    async def play(self, filename: str):
-        # Stop current audio
-        if self._current_task and not self._current_task.done():
-            self._current_task.cancel()
-            try:
-                await self._current_task
-            except asyncio.CancelledError:
-                pass
-
-        self.is_playing = True
-        
-        # Check cache vs disk
-        if filename in self._cache:
-            self._current_task = asyncio.create_task(self._stream_cached(filename))
-        else:
-            self._current_task = asyncio.create_task(self._stream_from_disk(filename))
-            
-        await self._current_task
-        self.is_playing = False
-
-    def _decode_file(self, filename):
-        """Generator that yields audio frames from a file."""
-        container = av.open(filename)
-        stream = container.streams.audio[0]
-        resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-        buffer = bytearray()
-        
-        for frame in container.decode(stream):
-            for resampled_frame in resampler.resample(frame):
-                buffer.extend(resampled_frame.to_ndarray().tobytes())
-                while len(buffer) >= 960:
-                    yield buffer[:960]
-                    buffer = buffer[960:]
-        container.close()
-
-    async def _stream_cached(self, filename):
-        """Streams pre-loaded frames from memory."""
-        frames = self._cache[filename]
-        for chunk_data in frames:
-            lk_frame = rtc.AudioFrame(
-                data=chunk_data, sample_rate=SAMPLE_RATE, 
-                num_channels=NUM_CHANNELS, samples_per_channel=FRAME_SIZE_SAMPLES
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS grievances (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                transcript TEXT NOT NULL,
+                language TEXT,
+                created_at TEXT NOT NULL,
+                status TEXT DEFAULT 'pending'
             )
-            await self.source.capture_frame(lk_frame)
-            await asyncio.sleep(0.01)
+        """)
+        conn.commit()
+        conn.close()
 
-    async def _stream_from_disk(self, filename):
-        """Streams larger files from disk."""
-        try:
-            for chunk_data in self._decode_file(filename):
-                lk_frame = rtc.AudioFrame(
-                    data=chunk_data, sample_rate=SAMPLE_RATE, 
-                    num_channels=NUM_CHANNELS, samples_per_channel=FRAME_SIZE_SAMPLES
-                )
-                await self.source.capture_frame(lk_frame)
-                await asyncio.sleep(0.01)
-        except Exception as e:
-            print(f"Error streaming {filename}: {e}")
-
-class GrievanceBotLogic:
-    def __init__(self):
-        self.state = "greeting"
-        self.grievance_text = ""
-        self.should_disconnect = False
-        self.grievance_timestamp = None
-        self.has_played_probe = False  
-        self.ack_sounds = ["ack_1", "ack_2", "ack_3"]
-        self.save_data = None  # Store data to save instead of triggering immediately
-
-    def process_input(self, text: str) -> str:
-        if self.should_disconnect: 
-            return None
-        
-        text_clean = text.strip()
-        text_lower = text_clean.lower()
-        words = text_lower.split() 
-        word_count = len(words)
-        
-        print(f"\n[USER SAYS] '{text_clean}' (Words: {word_count})")
-
-        # GLOBAL GUARD: IGNORE QUESTIONS
-        if text_clean.endswith("?") or text_lower.startswith(("what", "how", "why", "who", "where")):
-            print("   -> Detected question/inquiry. Ignoring exit triggers.")
-            if self.state == "listening":
-                self.grievance_text += " " + text_clean
-            return None
-
-        # --- GREETING PHASE ---
-        if self.state == "greeting":
-            exit_triggers = ["no", "nothing", "nope", "nah"]
-            is_pure_refusal = any(t in text_lower for t in exit_triggers) and word_count < 4
-            
-            if is_pure_refusal:
-                print(f"   -> Greeting refusal detected: '{text_clean}'")
-                self.state = "closing"
-                self.should_disconnect = True
-                return "early_exit"
-            
-            self.state = "listening"
-            self.grievance_text += text_clean
-            self.grievance_timestamp = time.time()
-
-            if word_count > 7:
-                self.has_played_probe = True
-                print("   -> Substantial opening detected, playing probe.")
-                return "probe_details"
-            
-            return None
-
-        # --- LISTENING PHASE ---
-        elif self.state == "listening":
-            self.grievance_text += " " + text_clean
-            
-            # STRONG EXIT PHRASES (High Confidence)
-            strong_exit_phrases = [
-                "that's all", "that is all", "that's it", "that is it",
-                "nothing else", "nothing more", "i'm done", "i am done",
-                "have a good day", "thank you bye", "thanks bye", "thank you", "Thank you", "That's all"
-            ]
-            
-            for phrase in strong_exit_phrases:
-                if phrase in text_lower:
-                    if text_lower.endswith(phrase) or text_lower.endswith(phrase + "."):
-                        print(f"   -> Strong exit phrase detected: '{phrase}'")
-                        return self._prepare_exit()
-                    
-                    idx = text_lower.find(phrase)
-                    remainder = text_lower[idx+len(phrase):].strip()
-                    if len(remainder.split()) <= 2:
-                        print(f"   -> Strong exit phrase detected (w/ tail): '{phrase}'")
-                        return self._prepare_exit()
-
-            # CONTEXTUAL TRIGGERS (Medium Confidence)
-            if text_lower.endswith("bye") or text_lower.endswith("goodbye"):
-                print(f"   -> Farewell detected: '{text_clean}'")
-                return self._prepare_exit()
-            
-            elif text_lower in ["thank you", "thanks", "thank you.", "thanks."]:
-                print(f"   -> Solo gratitude detected")
-                return self._prepare_exit()
-
-            # EMPATHY & BACKCHANNEL (avoid spamming on noise)
-            if word_count < 2:
-                print("   -> Fragment/Noise detected. Ignoring.")
-                return None
-
-            # Play probe once on substantial input
-            if not self.has_played_probe and word_count > 5:
-                self.has_played_probe = True
-                print("   -> Playing Empathy Probe (Once only)")
-                return "probe_details"
-
-            # Backchannel on longer utterances
-            if word_count > 7 and random.random() < 0.7:
-                selected_ack = random.choice(self.ack_sounds)
-                print(f"   -> Backchanneling: {selected_ack}")
-                return selected_ack
-            
-            print("   -> Listening quietly...")
-            return None
-
-        return None
-    
-    def _prepare_exit(self):
-        """Prepare for exit. Stores data for background save, returns immediately."""
-        print(f"\n{'='*60}")
-        print("[PREPARING EXIT] Grievance collected")
-        print(f"Words collected: {len(self.grievance_text.split())}")
-        print(f"{'='*60}\n")
-        
-        # Store the data to be saved (don't start any async operations)
-        self.save_data = {
-            'transcript': self.grievance_text,
-            'timestamp': self.grievance_timestamp or time.time()
-        }
-        
-        # Set flags
-        self.state = "closing"
-        self.should_disconnect = True
-        
-        # Return immediately
-        return "closing"
-    
-    async def save_grievance_background(self):
-        """Save the grievance in background. Call after playing closing audio."""
-        if not self.save_data:
+    async def save_grievance(self, transcript: str, language: str = "en"):
+        if not transcript.strip():
+            logger.warning("[DB] Attempted to save empty grievance, skipping")
             return
-            
-        try:
-            print("[BACKGROUND] Starting grievance processing...")
-            result = await grievance_processor.process_and_store(
-                transcript=self.save_data['transcript'],
-                timestamp=self.save_data['timestamp']
-            )
-            
-            print(f"\n{'='*60}")
-            print(f"[SUCCESS] Grievance processed and stored")
-            print(f"ID: {result.get('id', 'N/A')}")
-            print(f"Summary: {result.get('summary', 'N/A')[:100]}...")
-            print(f"{'='*60}\n")
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to process grievance: {e}")
-        finally:
-            self.save_data = None
+
+        def _save():
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            record_id = str(uuid.uuid4())
+            current_time = datetime.now().isoformat()
+            try:
+                cursor.execute("""
+                    INSERT INTO grievances (id, timestamp, transcript, language, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (record_id, current_time, transcript, language, current_time))
+                conn.commit()
+                logger.info(f"[DB] Saved grievance ID: {record_id} (Lang: {language})")
+            except Exception as e:
+                logger.error(f"[DB] Error saving grievance: {e}")
+            finally:
+                conn.close()
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, _save)
+
+
+class GrievanceTracker:
+    def __init__(self):
+        self.grievance_text = []
+        self.selected_language = None
+    
+    def set_language(self, language_code: str):
+        self.selected_language = language_code
+        logger.info(f"[TRACKER] Language set to: {language_code}")
+    
+    def add_user_message(self, text: str):
+        self.grievance_text.append(f"Employee: {text}")
+    
+    def add_agent_message(self, text: str):
+        self.grievance_text.append(f"Agent: {text}")
+    
+    def get_full_grievance(self) -> str:
+        return "\n".join(self.grievance_text)
+    
+    def reset(self):
+        """Reset tracker for new conversation"""
+        self.grievance_text = []
+        logger.info("[TRACKER] Reset grievance text")
 
 
 async def entrypoint(ctx: JobContext):
-    print(f"Room created: {ctx.room.name}. Waiting for user...")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
-    source = rtc.AudioSource(SAMPLE_RATE, NUM_CHANNELS)
-    track = rtc.LocalAudioTrack.create_audio_track("bot_voice", source)
-    await ctx.room.local_participant.publish_track(track)
+    logger.info(f"[ROOM] Connecting to room: {ctx.room.name}")
     
-    # Initialize player and preload
-    player = AudioFilePlayer(source)
-    player.preload(AUDIO_FILES)
-
-    # Setup STT
-    stt_provider = deepgram.STT(
-        model="nova-2", 
-        language="en", 
-        smart_format=True,
-        endpointing_ms=500,
-        interim_results=True
-    )
-    stt_stream = stt_provider.stream()
-    bot = GrievanceBotLogic()
-
-    last_processed_transcript = ""
+    # Verify Groq API key
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        logger.error("[ERROR] GROQ_API_KEY not found in environment variables!")
+        raise ValueError("GROQ_API_KEY is required. Add it to your .env file")
     
-    async def process_stt_events():
-        nonlocal last_processed_transcript
+    db_manager = DatabaseManager()
+    await ctx.connect()
+    
+    grievance_tracker = GrievanceTracker()
+    
+    # State management
+    should_end_call = asyncio.Event()
+    language_selected = asyncio.Event()
+    selected_lang_code = "en"
+    tool_called = {"called": False}
+    defaulted_to_english = {"value": False}  # Track if we defaulted
+    
+    # --- LANGUAGE SELECTION TOOL ---
+    @function_tool
+    async def select_language(language: Optional[str] = None):
+        """
+        Select the language based on user preference. 
+        Call this immediately after user states their preference.
         
-        async for event in stt_stream:
-            if event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-                if player.is_playing and len(event.alternatives[0].text) > 5:
-                    print("[BARGE-IN] User speaking, stopping audio.")
-                
-            elif event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                transcript = event.alternatives[0].text
-                if not transcript or transcript == last_processed_transcript:
-                    continue
-                
-                last_processed_transcript = transcript
-                audio_key = bot.process_input(transcript)
-                
-                if audio_key:
-                    # Handle closing/early_exit
-                    if audio_key in ("closing", "early_exit"):
-                        # Play closing FIRST (immediately)
-                        print("[CLOSING] Playing farewell message...")
-                        await player.play(AUDIO_FILES["closing"])
-                        
-                        # THEN start background save (after audio is playing/done)
-                        print("[CLOSING] Starting background save...")
-                        asyncio.create_task(bot.save_grievance_background())
-                        
-                        # Brief pause then disconnect
-                        await asyncio.sleep(0.5)
-                        print("[CLOSING] Disconnecting from room...")
-                        await ctx.room.disconnect()
-                        break
-                    else:
-                        # Normal audio playback
-                        await player.play(AUDIO_FILES[audio_key])
-    
-    asyncio.create_task(process_stt_events())
+        Args:
+            language: The language name the user mentioned (e.g., "english", "hindi", "tamil", "kannada", etc.).
+                     IMPORTANT: Use the EXACT language the user mentioned, not a default!
+        """
+        nonlocal selected_lang_code
+        
+        if language is None or not language.strip():
+            logger.warning("[TOOL] LLM passed None/empty for language. Defaulting to English.")
+            language = "english"
 
-    @ctx.room.on("track_subscribed")
-    def on_track_subscribed(
-        track: rtc.Track, 
-        publication: rtc.TrackPublication, 
-        participant: rtc.RemoteParticipant
-    ):
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            print(f"User joined: {participant.identity}")
-            audio_stream = rtc.AudioStream(track)
-            
-            async def push_audio_to_stt():
-                async for event in audio_stream:
-                    if not player.is_playing:
-                        stt_stream.push_frame(event.frame)
-            
-            asyncio.create_task(push_audio_to_stt())
-            
-            async def play_greeting():
-                await asyncio.sleep(1.5) 
-                print("Playing Greeting...")
-                await player.play(AUDIO_FILES["greeting"])
-            
-            asyncio.create_task(play_greeting())
+        lang_lower = language.lower().strip()
+        logger.info(f"[TOOL] Received language selection: '{lang_lower}'")
+        
+        # Find matching language code with improved matching
+        found_code = None
+        found_name = "English"
+        
+        # First: Try exact match on language name (english, hindi, tamil, kannada, etc.)
+        for name, data in SUPPORTED_LANGUAGES.items():
+            if name.lower() == lang_lower:
+                found_code = data["code"]
+                found_name = data["name"]
+                logger.info(f"[TOOL] Exact match: '{lang_lower}' → {found_name} ({found_code})")
+                break
+        
+        # Second: Try partial match (if user said "I want kannada")
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                if name.lower() in lang_lower or lang_lower in name.lower():
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Partial match: '{lang_lower}' contains {name} → {found_name} ({found_code})")
+                    break
+        
+        # Third: Try matching native script
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                native_name = data["name"].lower()
+                if native_name in lang_lower or lang_lower in native_name:
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Native script match: '{lang_lower}' → {found_name} ({found_code})")
+                    break
+        
+        # Fourth: Try by language code (en, hi, kn, etc.)
+        if found_code is None:
+            for name, data in SUPPORTED_LANGUAGES.items():
+                if data["code"] == lang_lower:
+                    found_code = data["code"]
+                    found_name = data["name"]
+                    logger.info(f"[TOOL] Code match: '{lang_lower}' → {found_name} ({found_code})")
+                    break
+        
+        # Last resort: Default to English
+        if found_code is None:
+            logger.warning(f"[TOOL] No match found for '{lang_lower}', defaulting to English")
+            found_code = "en"
+            found_name = "English"
+        
+        selected_lang_code = found_code
+        grievance_tracker.set_language(selected_lang_code)
+        tool_called["called"] = True
+        
+        logger.info(f"[TOOL] Language finalized: {found_name} ({selected_lang_code})")
+        language_selected.set()
+        
+        return ""  # Empty to prevent speaking
+
+    # --- END CALL TOOL ---
+    @function_tool
+    async def end_call(confirmation: str = "yes"):
+        """
+        End the grievance collection call.
+        Call this only when the user explicitly indicates they are done.
+        """
+        logger.info(f"[TOOL] end_call triggered")
+        should_end_call.set()
+        return ""
+
+    # ============================================================================
+    # STAGE 1: LANGUAGE SELECTION
+    # ============================================================================
+    logger.info("[STAGE 1] Starting Language Selection Phase")
+    
+    # OPTIMIZED VAD SETTINGS
+    vad_config_stage1 = silero.VAD.load(
+        min_speech_duration=0.1,       # Reduced to catch speech faster
+        min_silence_duration=0.5,      # Reasonable pause detection
+        activation_threshold=0.5,      # Moderate threshold
+        sample_rate=16000,
+    )
+    
+    # GROQ LLM - LLAMA 3.1 8B INSTANT (Fast & Efficient)
+    # This model is extremely fast and great for simple tasks like language selection
+    llm_config_stage1 = groq.LLM(
+        model="llama-3.1-8b-instant",  # Production model, super fast
+        temperature=0.3,  # Low temperature for deterministic responses
+    )
+    
+    session_1 = AgentSession(
+        vad=vad_config_stage1,
+        stt=groq.STT(
+            model="whisper-large-v3-turbo"
+            #language="en"  # Always listen in English for language selection
+        ),
+        llm=llm_config_stage1,
+        tts=sarvam.TTS(
+            target_language_code="en-IN", 
+            speaker="anushka"
+        ),
+    )
+    
+    language_agent = Agent(
+        instructions=LANGUAGE_SELECTION_PROMPT,
+        tools=[select_language],
+    )
+
+    # Event listener for debugging
+    @session_1.on("conversation_item_added")
+    def on_item_stage1(event):
+        if event.item.text_content:
+            logger.info(f"[STAGE 1] {event.item.role}: {event.item.text_content}")
+
+    # Start session with noise cancellation - FIXED
+    session_1_task = asyncio.create_task(
+        session_1.start(
+            agent=language_agent, 
+            room=ctx.room,
+            room_options=rtc.RoomOptions(
+                audio_input=rtc.AudioInputOptions(
+                    noise_cancellation=noise_cancellation.BVC(),
+                ),
+            ),
+        )
+    )
+    # Wait for session to fully initialize
+    logger.info("[STAGE 1] Waiting for session to initialize...")
+    await asyncio.sleep(0.1)  # Increased wait time for full initialization
+    
+    # Send initial greeting without blocking listening
+    logger.info("[STAGE 1] Sending initial greeting...")
+    try:
+        # Use say() instead of generate_reply() to avoid blocking the conversation flow
+        await session_1.say(
+            "Hello! Which language would you like to speak? We support English, Hindi, Tamil, Kannada, Telugu, Bengali, Marathi, Gujarati, Malayalam, Punjabi, and Odia.",
+            allow_interruptions=True,  # Allow user to interrupt
+        )
+        logger.info("[STAGE 1] ✓ Greeting sent, now listening...")
+    except Exception as e:
+        logger.error(f"[STAGE 1] Error sending greeting: {e}")
+        # Continue anyway, the agent should still work
+    
+    # Wait for language selection with timeout
+    logger.info("[STAGE 1] Waiting for language selection...")
+    try:
+        await asyncio.wait_for(language_selected.wait(), timeout=60.0)
+        logger.info(f"[STAGE 1] ✓ Language selected: {selected_lang_code}")
+    except asyncio.TimeoutError:
+        logger.warning("[STAGE 1] ⚠ Timeout - defaulting to English")
+        selected_lang_code = "en"
+        grievance_tracker.set_language(selected_lang_code)
+        defaulted_to_english["value"] = True  # Mark that we defaulted
+    
+    if not tool_called["called"]:
+        logger.warning("[STAGE 1] ⚠ Tool was never called, defaulting to English")
+        defaulted_to_english["value"] = True
+    
+    # ============================================================================
+    # GRACEFUL SESSION 1 SHUTDOWN
+    # ============================================================================
+    logger.info("[TRANSITION] Shutting down language selection...")
+    
+    try:
+        await session_1.aclose()
+        logger.info("[TRANSITION] ✓ Session 1 closed")
+    except Exception as e:
+        logger.error(f"[TRANSITION] Error closing session 1: {e}")
+    
+    session_1_task.cancel()
+    try:
+        await session_1_task
+    except asyncio.CancelledError:
+        logger.info("[TRANSITION] ✓ Session 1 task cancelled")
+    
+    # CRITICAL BUFFER - Allow audio to drain
+    logger.info(f"[TRANSITION] Audio buffer flush ({selected_lang_code})...")
+    await asyncio.sleep(0.5)
+    
+    # ============================================================================
+    # STAGE 2: GRIEVANCE COLLECTION
+    # ============================================================================
+    logger.info("[STAGE 2] Starting Grievance Collection Phase")
+
+    prompt = GRIEVANCE_PROMPTS.get(selected_lang_code, GRIEVANCE_PROMPTS["en"])
+    
+    # Get TTS code
+    tts_code = "en-IN"
+    for lang_data in SUPPORTED_LANGUAGES.values():
+        if lang_data["code"] == selected_lang_code:
+            tts_code = lang_data["sarvam_tts_code"]
+            logger.info(f"[STAGE 2] Using TTS code: {tts_code}")
+            break
+
+    # OPTIMIZED VAD for Stage 2
+    vad_config_stage2 = silero.VAD.load(
+        min_speech_duration=0.5,
+        min_silence_duration=0.5,
+        activation_threshold=0.5,
+        sample_rate=16000,
+    )
+    
+    # --- CHANGED: OLLAMA LLM (via OpenAI Plugin) ---
+    # Replaced Groq with OpenAI plugin pointing to local Ollama
+    llm_config_stage2 = groq.LLM(
+        model="llama-3.3-70b-versatile",  # Production model, super fast
+        temperature=0.4,  # Low temperature for deterministic responses
+    )
+
+    session_2 = AgentSession(
+        vad=vad_config_stage2,
+        stt=groq.STT(
+            model="whisper-large-v3-turbo", 
+            language=selected_lang_code
+        ),
+        llm=llm_config_stage2,
+        tts=sarvam.TTS(
+            target_language_code=tts_code, 
+            speaker="anushka"
+        ),
+    )
+
+    grievance_agent = Agent(
+        instructions=prompt,
+        tools=[end_call],
+    )
+    
+    # Track conversation
+    @session_2.on("conversation_item_added")
+    def on_item_stage2(event):
+        if event.item.text_content:
+            logger.info(f"[STAGE 2] {event.item.role}: {event.item.text_content}")
+            if event.item.role == "user":
+                grievance_tracker.add_user_message(event.item.text_content)
+            elif event.item.role == "assistant":
+                grievance_tracker.add_agent_message(event.item.text_content)
+
+    # Start session with noise cancellation - FIXED
+    session_2_task = asyncio.create_task(
+        session_2.start(
+            agent=grievance_agent,
+            room=ctx.room,
+            room_options=rtc.RoomOptions(
+                audio_input=rtc.AudioInputOptions(
+                    noise_cancellation=noise_cancellation.BVC(),
+                ),
+            ),
+        )
+    )   
+    # Warmup period
+    logger.info("[STAGE 2] Session warmup...")
+    await asyncio.sleep(0.5)
+    
+    # Generate greeting with fallback message if defaulted to English
+    try:
+        if defaulted_to_english["value"]:
+            # Add fallback message ONLY when we defaulted to English
+            logger.info("[STAGE 2] Adding fallback message for English default")
+            await session_2.say(
+                "I didn't catch your language preference, so I'll continue in English. Now, please tell me about your grievance.",
+                allow_interruptions=True
+            )
+        else:
+            # Normal greeting
+            await session_2.generate_reply()
+        logger.info("[STAGE 2] ✓ Initial greeting sent")
+    except asyncio.TimeoutError:
+        logger.error("[STAGE 2] ⚠ Timeout generating greeting")
+    except Exception as e:
+        logger.error(f"[STAGE 2] Error: {e}")
+
+    # Wait for completion
+    logger.info("[STAGE 2] Collecting grievance...")
+    await should_end_call.wait()
+    
+    # ============================================================================
+    # CLEANUP & SAVE
+    # ============================================================================
+    logger.info("[CLEANUP] Ending session...")
+    await asyncio.sleep(3.0)
+    
+    try:
+        await session_2.aclose()
+        logger.info("[CLEANUP] ✓ Session 2 closed")
+    except Exception as e:
+        logger.error(f"[CLEANUP] Error: {e}")
+    
+    session_2_task.cancel()
+    try:
+        await session_2_task
+    except asyncio.CancelledError:
+        logger.info("[CLEANUP] ✓ Session 2 task cancelled")
+    
+    # Save to database
+    full_log = grievance_tracker.get_full_grievance()
+    if full_log.strip():
+        logger.info(f"[CLEANUP] Saving {len(full_log)} chars to DB")
+        await db_manager.save_grievance(full_log, selected_lang_code)
+    else:
+        logger.warning("[CLEANUP] ⚠ No content to save")
+    
+    await ctx.disconnect()
+    logger.info("[END] ✓ Session complete")
+
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))

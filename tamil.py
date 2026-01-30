@@ -1,302 +1,257 @@
-import asyncio
-import os
 import sqlite3
-import uuid
+import json
+import requests
+from google.cloud import translate_v2
 from datetime import datetime
-from dotenv import load_dotenv
 
-# LiveKit Imports
-from livekit import agents
-from livekit.agents import (
-    Agent,
-    AgentSession,
-    JobContext,
-    WorkerOptions,
-    cli,
-    function_tool,
-)
-from livekit.plugins import sarvam, groq, silero
+# Configuration
+DB_PATH = r'c:\Users\ISFL-RT000265\Desktop\process\grievance.db'
+OLLAMA_API_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "deepseek-r1:14b"  # You can change this to your preferred model (llama2, neural-chat, etc.)
 
-load_dotenv()
+# Initialize Google Translate client (requires credentials)
+try:
+    translate_client = translate_v2.Client()
+    TRANSLATE_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: Google Translate not available ({e}). Will attempt fallback.")
+    TRANSLATE_AVAILABLE = False
 
-# --- Database Manager ---
-class DatabaseManager:
-    def __init__(self, db_path="grievance.db"):
-        self.db_path = db_path
-        self.init_db()
 
-    def init_db(self):
-        """Initialize the database table if it doesn't exist."""
-        conn = sqlite3.connect(self.db_path)
+def translate_to_english(text, language):
+    """Translate text to English using Google Translate or fallback method."""
+    if not text:
+        return text
+    
+    if language.lower() == 'en' or language.lower() == 'english':
+        return text
+    
+    try:
+        if TRANSLATE_AVAILABLE:
+            result = translate_client.translate_text(text)
+            return result['translatedText']
+    except Exception as e:
+        print(f"Translation error: {e}")
+    
+    # If translation fails, return original text
+    print(f"Warning: Could not translate from {language}. Returning original text.")
+    return text
+
+
+def ensure_columns_exist(conn):
+    """Ensure all required columns exist in the grievances table."""
+    cursor = conn.cursor()
+    
+    # Get existing columns
+    cursor.execute("PRAGMA table_info(grievances)")
+    existing_columns = {row[1] for row in cursor.fetchall()}
+    
+    # Define new columns to add
+    new_columns = {
+        'translated_transcript': 'TEXT',
+        'category': 'TEXT',
+        'priority': 'TEXT',
+        'sentiment': 'TEXT',
+        'summary': 'TEXT',
+        'tags': 'TEXT',
+        'department': 'TEXT',
+        'processed_at': 'TEXT',
+        'analysis_json': 'TEXT'
+    }
+    
+    # Add missing columns
+    for col_name, col_type in new_columns.items():
+        if col_name not in existing_columns:
+            try:
+                cursor.execute(f"ALTER TABLE grievances ADD COLUMN {col_name} {col_type}")
+                print(f"Added column: {col_name}")
+            except sqlite3.OperationalError as e:
+                print(f"Column {col_name} already exists or error: {e}")
+    
+    conn.commit()
+
+
+def send_to_ollama(transcript):
+    """Send transcript to Ollama for analysis."""
+    prompt = f"""Analyze this customer grievance and provide a structured categorization.
+
+Grievance transcript:
+"{transcript}"
+
+Please provide:
+1. Category (e.g., POSH, Managerial, Data, Hygiene, Compensation, Workplace Environment, Conflict, Career, Attendance)
+2. Priority (High, Medium, Low)
+3. Sentiment (Positive, Neutral, Negative, Very Negative)
+4. Brief Summary (1-2 sentences)
+5. Tags (up to 5 relevant keywords)
+6. Location (Extract specific branch, city, or office. If NOT found, return "Undisclosed Location")
+7. Department (Extract specific department e.g., Sales, IT, HR, Logistics. If NOT found, return "General")
+
+Respond strictly in VALID JSON format without markdown code blocks:
+{{
+    "category": "...",
+    "priority": "...",
+    "sentiment": "...",
+    "summary": "...",
+    "tags": ["tag1", "tag2"],
+    "location": "...",
+    "department": "..."
+}}"""
+    
+    try:
+        response = requests.post(
+            OLLAMA_API_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.3
+            },
+            timeout=300
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result.get('response', '')
+        else:
+            print(f"Ollama API error: {response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Error connecting to Ollama: {e}")
+        print("Make sure Ollama is running locally on port 11434")
+        return None
+
+
+def parse_ollama_response(response_text):
+    """Parse JSON response from Ollama."""
+    try:
+        # Find JSON content in the response
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        
+        if start_idx != -1 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse JSON response: {e}")
+        print(f"Response: {response_text}")
+    
+    return None
+
+
+def process_grievances():
+    """Main function to process pending grievances."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        # Ensure all columns exist
+        ensure_columns_exist(conn)
+        
+        # Get all pending grievances
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS grievances (
-                id TEXT PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                transcript TEXT NOT NULL,
-                category TEXT,
-                priority TEXT,
-                sentiment TEXT,
-                summary TEXT,
-                tags TEXT,
-                created_at TEXT NOT NULL,
-                location TEXT,
-                status TEXT DEFAULT 'pending'
-            )
+            SELECT id, transcript, language, location 
+            FROM grievances 
+            WHERE status = 'pending'
         """)
-        conn.commit()
-        conn.close()
-
-    def save_grievance(self, transcript: str):
-        """Save the transcript, generating ID and timestamps automatically."""
-        if not transcript.strip():
-            print("[DB] Transcript is empty, skipping save.")
+        
+        pending_grievances = cursor.fetchall()
+        print(f"Found {len(pending_grievances)} pending grievances to process")
+        
+        if not pending_grievances:
+            print("No pending grievances found.")
+            conn.close()
             return
-
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        record_id = str(uuid.uuid4())
-        current_time = datetime.now().isoformat()
-
-        try:
+        
+        # Process each grievance
+        for idx, (grievance_id, transcript, language, location) in enumerate(pending_grievances, 1):
+            print(f"\n{'='*60}")
+            print(f"Processing grievance {idx}/{len(pending_grievances)} (ID: {grievance_id})")
+            print(f"{'='*60}")
+            
+            # Step 1: Translate to English
+            print(f"Original language: {language}")
+            translated_transcript = translate_to_english(transcript, language)
+            print(f"Translation complete")
+            
+            # Step 2: Send to Ollama for analysis
+            print("Sending to Ollama for analysis...")
+            ollama_response = send_to_ollama(translated_transcript)
+            
+            if not ollama_response:
+                print(f"Failed to get response from Ollama for ID {grievance_id}")
+                continue
+            
+            # Step 3: Parse response
+            print("Parsing analysis results...")
+            analysis = parse_ollama_response(ollama_response)
+            
+            if not analysis:
+                print(f"Failed to parse analysis for ID {grievance_id}")
+                continue
+            
+            # Display results
+            print("\nAnalysis Results:")
+            print(f"  Category: {analysis.get('category', 'N/A')}")
+            print(f"  Priority: {analysis.get('priority', 'N/A')}")
+            print(f"  Sentiment: {analysis.get('sentiment', 'N/A')}")
+            print(f"  Summary: {analysis.get('summary', 'N/A')}")
+            print(f"  Tags: {', '.join(analysis.get('tags', []))}")
+            print(f"  Location: {analysis.get('location', 'N/A')}")
+            print(f"  Department: {analysis.get('department', 'N/A')}")
+            
+            # Step 4: Update database
+            processed_at = datetime.now().isoformat()
+            tags_str = ','.join(analysis.get('tags', []))
+            
             cursor.execute("""
-                INSERT INTO grievances (id, timestamp, transcript, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (record_id, current_time, transcript, current_time))
+                UPDATE grievances 
+                SET translated_transcript = ?,
+                    category = ?,
+                    priority = ?,
+                    sentiment = ?,
+                    summary = ?,
+                    tags = ?,
+                    department = ?,
+                    processed_at = ?,
+                    analysis_json = ?,
+                    status = 'completed'
+                WHERE id = ?
+            """, (
+                translated_transcript,
+                analysis.get('category', ''),
+                analysis.get('priority', ''),
+                analysis.get('sentiment', ''),
+                analysis.get('summary', ''),
+                tags_str,
+                analysis.get('department', ''),
+                processed_at,
+                json.dumps(analysis),
+                grievance_id
+            ))
             
             conn.commit()
-            print(f"[DB] Successfully saved grievance ID: {record_id}")
-        except Exception as e:
-            print(f"[DB] Error saving grievance: {e}")
-        finally:
-            conn.close()
-
-# --- Tamil System Prompt ---
-SYSTEM_INSTRUCTIONS = """நீங்கள் "HR Voice Assistant", ஒரு தொழில்முறை மற்றும் அனுதாபமுள்ள குறைதீர்ப்பு சேகரிப்பாளர். ஆலோசனை அல்லது தீர்வுகளை வழங்காமல் குறைகளை திறமையாக பதிவு செய்வதே உங்கள் இலக்கு.
-
-முக்கிய நடத்தைகள்:
-- **பாணி:** அன்பானது ஆனால் சுருக்கமாக (அதிகபட்சம் 2 வாக்கியங்கள்). இயல்பான, குறைந்தபட்ச ஒப்புதல்களைப் பயன்படுத்துங்கள் ("புரிகிறது," "தொடர்ந்து சொல்லுங்கள்").
-- **தேவையான தகவல்:** நீங்கள் சேகரிக்க வேண்டும்: 1) குறைதீர்ப்பு, 2) இடம், மற்றும் 3) துறை.
-- **தவறிய தகவல்:** பயனர் இடம் அல்லது துறையைத் தவிர்த்தால், அவர்களிடம் இயல்பாக *ஒரு முறை* கேளுங்கள்.
-
-ஓட்டம்:
-1. **வாழ்த்து:** சுருக்கமான வரவேற்பு + அவர்களை பேச அழைக்கவும்.
-2. **கேளுங்கள்:** இடையூறு இல்லாமல் ஒப்புக்கொள்ளுங்கள்.
-3. **முடிவு:** பயனர் அவர்கள் முடித்துவிட்டதாகக் குறிப்பிடும்போது (எ.கா. "அவ்வளவுதான்," "நான் முடித்துவிட்டேன்," அல்லது "நன்றி"):
-   - பதிலளிக்கவும்: "இதைப் பகிர்ந்ததற்கு நன்றி. உங்கள் குறைதீர்ப்பு பதிவு செய்யப்பட்டு மதிப்பாய்வு செய்யப்படும். கவனமாக இருங்கள்."
-   - **உடனடியாக** `end_call` செயல்பாட்டை அழைக்கவும்.
-
-கட்டுப்பாடுகள்:
-- சிக்கல்களைத் தீர்க்காதீர்கள் அல்லது ஆலோசனை வழங்காதீர்கள்.
-- "வேறு ஏதாவது உள்ளதா?" என்று மீண்டும் கேட்காதீர்கள்.
-- பயனர் முழுமையைக் குறிக்கும்போது மட்டுமே `end_call` ஐ அழைக்கவும்.
-
-முடிவு வரிசை (100% முழுமையானதும் மட்டும்):
-1. கூறவும்: "இதைப் பகிர்ந்ததற்கு நன்றி. உங்கள் குறைதீர்ப்பு பதிவு செய்யப்பட்டு எங்கள் குழுவால் மதிப்பாய்வு செய்யப்படும். கவனமாக இருங்கள்."
-2. "grievance_complete" காரணத்துடன் end_call ஐ அழைக்கவும்
-
-நினைவில் கொள்ளுங்கள்: உங்கள் வேலை முழுமையான தகவலைச் சேகரிப்பது. பொறுமையாகவும் முழுமையாகவும் இருங்கள்."""
-
-
-class GrievanceTracker:
-    """Track grievance conversation and manage call state."""
-    
-    def __init__(self):
-        self.grievance_text = []  # Tamil transcript
-        self.conversation_history = []
-        self.word_count = 0
-    
-    def add_user_message(self, text: str):
-        """Add user message in Tamil."""
-        self.grievance_text.append(f"பணியாளர்: {text}")
-        self.conversation_history.append({"role": "user", "content": text})
-        self.word_count += len(text.split())
-        print(f"[USER MESSAGE] {text[:100]}...")
-    
-    def add_agent_message(self, text: str):
-        """Add agent message to history."""
-        self.conversation_history.append({"role": "assistant", "content": text})
-    
-    def get_full_grievance(self) -> str:
-        """Get the complete grievance transcript in Tamil."""
-        return "\n".join(self.grievance_text)
-    
-    def get_stats(self) -> dict:
-        """Get grievance statistics."""
-        return {
-            "total_messages": len(self.conversation_history),
-            "user_messages": len([m for m in self.conversation_history if m["role"] == "user"]),
-            "word_count": self.word_count,
-        }
-
-
-async def entrypoint(ctx: JobContext):
-    """Main entrypoint for the voice agent."""
-    
-    print(f"[ROOM] Connecting to room: {ctx.room.name}")
-    
-    # Initialize Database
-    db_manager = DatabaseManager()
-
-    # Connect to the room
-    await ctx.connect()
-    
-    # Initialize the grievance tracker
-    grievance_tracker = GrievanceTracker()
-    
-    # Flag to track if call should end
-    should_end_call = asyncio.Event()
-    
-    # Define the end_call function tool
-    @function_tool
-    async def end_call(
-        confirmation: str = "yes"
-    ):
-        """
-        பயனர் முடித்துவிட்டதாகக் குறிப்பிடும்போது அல்லது உரையாடல் முடிந்தவுடன் குறைதீர்ப்பு சேகரிப்பு அழைப்பை முடிக்கவும்.
+            print(f"✓ Grievance {grievance_id} processed and updated in database")
         
-        Args:
-            confirmation: அழைப்பை முடிக்க உறுதிப்படுத்தல் (இயல்புநிலை: "yes")
-        """
-        print("[FUNCTION] end_call function invoked by LLM")
-        should_end_call.set()
-        return "அழைப்பு முடிவடைதல் தொடங்கப்பட்டது. குறைதீர்ப்பு பதிவு செய்யப்பட்டுள்ளது."
-    
-    # Create the agent with Tamil instructions
-    agent = Agent(
-        instructions=SYSTEM_INSTRUCTIONS,
-        tools=[end_call],
-    )
-    
-    # Create agent session with Tamil language support
-    session = AgentSession(
-        vad=silero.VAD.load(
-            min_speech_duration=0.3,
-            min_silence_duration=0.8,
-        ),
-        stt=groq.STT(
-            model="whisper-large-v3-turbo",
-            language="ta",
-        ),
-        llm=groq.LLM(
-            model="openai/gpt-oss-20b",
-            temperature=0.7,
-        ),
-        tts=sarvam.TTS(
-            target_language_code="ta-IN",
-            speaker="anushka",
-        )
-    )
-    
-    # Event handlers for tracking conversation
-    @session.on("conversation_item_added")
-    def on_conversation_item_added(event):
-        """Called when a conversation item is added (user or agent)."""
-        item = event.item
+        print(f"\n{'='*60}")
+        print(f"Processing complete! {len(pending_grievances)} grievances processed.")
+        print(f"{'='*60}")
         
-        if item.role == "user":
-            # User message in Tamil
-            text = item.text_content or ""
-            if text:
-                print(f"\n[USER - தமிழ்] {text}")
-                grievance_tracker.add_user_message(text)
-        elif item.role == "assistant":
-            # Agent message
-            text = item.text_content or ""
-            if text and not item.interrupted:
-                print(f"[AGENT - தமிழ்] {text}")
-                grievance_tracker.add_agent_message(text)
+        conn.close()
     
-    @session.on("function_calls_finished")
-    def on_function_calls_finished(called_functions):
-        """Called when LLM finishes executing function calls."""
-        for func in called_functions:
-            print(f"[FUNCTION] Completed: {func.call_info.function_info.name}")
-    
-    print("[SESSION] Starting agent session...")
-    
-    # Start the session as a background task
-    session_task = asyncio.create_task(session.start(agent=agent, room=ctx.room))
-    
-    print("[SESSION] Waiting for participant to join...")
-    
-    # Wait for participant to join
-    while len(ctx.room.remote_participants) == 0:
-        await asyncio.sleep(0.1)
-    
-    print("[SESSION] Participant joined. Waiting for session to initialize...")
-    
-    # Wait for session to be ready
-    await asyncio.sleep(1.5)
-    
-    print("[SESSION] Sending initial greeting...")
-    
-    # Send initial greeting in Tamil
-    try:
-        await session.generate_reply(
-            instructions="சுருக்கமான, அன்பான வரவேற்பு கொடுத்து அவர்களின் குறைதீர்ப்பைப் பகிர்ந்து கொள்ளச் சொல்லுங்கள். ஒரே ஒரு வாக்கியம் மட்டும்."
-        )
     except Exception as e:
-        print(f"[ERROR] Failed to generate greeting: {e}")
-    
-    print("[AGENT] Ready to collect grievances in Tamil...")
-    
-    try:
-        # Wait only for the end_call signal
-        await should_end_call.wait()
-        
-        print("[CLOSING] end_call triggered. Waiting for final message...")
-        
-        # Give enough time for the final message to be generated and spoken
-        await asyncio.sleep(6.5)
-        
-        print("[CLOSING] Proceeding with disconnect")
-        
-        # Now cancel the session
-        session_task.cancel()
-        try:
-            await session_task
-        except asyncio.CancelledError:
-            pass
-        
-    except asyncio.CancelledError:
-        print("[SESSION] Session cancelled")
-        session_task.cancel()
-        try:
-            await session_task
-        except asyncio.CancelledError:
-            pass
-    finally:
-        # Print final grievance
-        stats = grievance_tracker.get_stats()
-        full_grievance = grievance_tracker.get_full_grievance()
-        
-        print("\n" + "="*70)
-        print("[GRIEVANCE COLLECTION COMPLETE]")
-        print("="*70)
-        print(f"Total Messages: {stats['total_messages']}")
-        print(f"User Messages: {stats['user_messages']}")
-        print(f"Word Count: {stats['word_count']}")
-        print("-"*70)
-        print("[TAMIL TRANSCRIPT]")
-        print(full_grievance)
-        print("="*70 + "\n")
-        
-        # Save Tamil transcript to database
-        print("[DB] Saving Tamil transcript to database...")
-        db_manager.save_grievance(full_grievance)
-        
-        print("[DISCONNECT] Closing connection...")
-        await ctx.room.disconnect()
-        print("[SESSION] Session ended")
+        print(f"Error processing grievances: {e}")
+        if conn:
+            conn.close()
 
 
 if __name__ == "__main__":
-    # Run the agent
-    cli.run_app(
-        WorkerOptions(
-            entrypoint_fnc=entrypoint,
-        )
-    )
+    print("Grievance Processing System")
+    print("="*60)
+    print("This script will:")
+    print("1. Translate transcripts to English")
+    print("2. Send to Ollama for analysis")
+    print("3. Store results in database")
+    print("="*60)
+    
+    process_grievances()

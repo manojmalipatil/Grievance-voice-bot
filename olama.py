@@ -18,9 +18,10 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     function_tool,
+    room_io,
 )
 # Added 'openai' to imports for Ollama support
-from livekit.plugins import sarvam, groq, silero, openai 
+from livekit.plugins import sarvam, groq, silero, openai, noise_cancellation  
 
 load_dotenv()
 
@@ -249,8 +250,8 @@ async def entrypoint(ctx: JobContext):
     session_1 = AgentSession(
         vad=vad_config_stage1,
         stt=groq.STT(
-            model="whisper-large-v3-turbo"
-            #language="en"  # Always listen in English for language selection
+            model="whisper-large-v3-turbo",
+            language="en"  # Always listen in English for language selection
         ),
         llm=llm_config_stage1,
         tts=sarvam.TTS(
@@ -272,20 +273,22 @@ async def entrypoint(ctx: JobContext):
 
     # Start session - this begins listening immediately
     session_1_task = asyncio.create_task(
-        session_1.start(agent=language_agent, room=ctx.room)
+        session_1.start(
+            agent=language_agent, 
+            room=ctx.room,
+        )
     )
-    
     # Wait for session to fully initialize
     logger.info("[STAGE 1] Waiting for session to initialize...")
-    await asyncio.sleep(1)  # Increased wait time for full initialization
+    await asyncio.sleep(0.1)  # Increased wait time for full initialization
     
     # Send initial greeting without blocking listening
     logger.info("[STAGE 1] Sending initial greeting...")
     try:
         # Use say() instead of generate_reply() to avoid blocking the conversation flow
         await session_1.say(
-            "Hello! Which language would you like to speak? We support English, Hindi, Tamil, Kannada, Telugu, Bengali, Marathi, Gujarati, Malayalam, Punjabi, and Odia.",
-            allow_interruptions=True,  # Allow user to interrupt
+            "Hello! Which language would you like to speak? We support Multiple Indian Languages.",
+            allow_interruptions=False,  # Allow user to interrupt
         )
         logger.info("[STAGE 1] ✓ Greeting sent, now listening...")
     except Exception as e:
@@ -343,8 +346,8 @@ async def entrypoint(ctx: JobContext):
 
     # OPTIMIZED VAD for Stage 2
     vad_config_stage2 = silero.VAD.load(
-        min_speech_duration=0.5,
-        min_silence_duration=0.8,
+        min_speech_duration=0.3,
+        min_silence_duration=0.5,
         activation_threshold=0.5,
         sample_rate=16000,
     )
@@ -352,7 +355,7 @@ async def entrypoint(ctx: JobContext):
     # --- CHANGED: OLLAMA LLM (via OpenAI Plugin) ---
     # Replaced Groq with OpenAI plugin pointing to local Ollama
     llm_config_stage2 = groq.LLM(
-        model="openai/gpt-oss-120b",  # Production model, super fast
+        model="llama-3.3-70b-versatile",  # Production model, super fast
         temperature=0.3,  # Low temperature for deterministic responses
     )
 
@@ -385,12 +388,14 @@ async def entrypoint(ctx: JobContext):
                 grievance_tracker.add_agent_message(event.item.text_content)
 
     session_2_task = asyncio.create_task(
-        session_2.start(agent=grievance_agent, room=ctx.room)
-    )
-    
+        session_2.start(
+            agent=grievance_agent,
+            room=ctx.room,
+        )
+    )   
     # Warmup period
     logger.info("[STAGE 2] Session warmup...")
-    await asyncio.sleep(1)
+    await asyncio.sleep(0.5)
     
     # Generate greeting
     try:
@@ -409,7 +414,7 @@ async def entrypoint(ctx: JobContext):
     # CLEANUP & SAVE
     # ============================================================================
     logger.info("[CLEANUP] Ending session...")
-    await asyncio.sleep(3.0)
+    await asyncio.sleep(10.0)
     
     try:
         await session_2.aclose()
@@ -431,7 +436,7 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.warning("[CLEANUP] ⚠ No content to save")
     
-    await ctx.disconnect()
+    await ctx.room.disconnect()
     logger.info("[END] ✓ Session complete")
 
 

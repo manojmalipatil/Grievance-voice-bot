@@ -9,7 +9,7 @@ import os
 class GrievanceProcessor:
     """Handles LLM categorization and SQLite storage of grievances."""
     
-    def __init__(self, db_path: str = "grievances.db", api_key: Optional[str] = None):
+    def __init__(self, db_path: str = "grievance.db", api_key: Optional[str] = None):
         self.db_path = db_path
         # Initialize Gemini
         api_key = api_key or os.getenv("GOOGLE_API_KEY")

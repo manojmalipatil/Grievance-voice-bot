@@ -3,7 +3,7 @@ import aiohttp
 import time
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen3:4b"
+MODEL = "qwen3:8b"
 
 PROMPT = """My father does not force me to go for a career his choice. He does not want that his son should follow only his profession. He wants that his son should go according to his own choice, suitability, and capability. But my father desires his son should go for a better future.
 
@@ -17,9 +17,9 @@ My brother, who is elder than me, is the tallest. He is a Youtuber and is fond o
 
 I love my family because they are the jewels of my life. They work hard so that we can get anything we desire makes me love and respect my parents considerably more. We play games every night and discuss various topics to spend some quality time together.Family games
 
-Summarise this essay in 20 words"""
+Summarise this essay in 200 words"""
 
-PARALLEL_CALLS = 2
+PARALLEL_CALLS = 100
 
 
 async def send_request(session, idx):
