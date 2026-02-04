@@ -2,6 +2,7 @@ import sqlite3
 import json
 import requests
 from datetime import datetime
+from deep_translator import GoogleTranslator
 
 # =========================
 # Configuration
@@ -10,43 +11,22 @@ DB_PATH = "grievance.db"
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "deepseek-r1:14b"
 
-# Initialize Translator
-TRANSLATE_AVAILABLE = True
-
-
 # =========================
 # Translation Function
 # =========================
 def translate_to_english(text, language):
-    """Translate text to English using LibreTranslate."""
+    """Translate text to English using Deep Translator (Google)."""
     if not text:
         return text
 
-    if language and language.lower() in ['en', 'english']:
+    if language and language.lower() in ["en", "english"]:
         return text
 
     try:
-        response = requests.post(
-            "https://libretranslate.com/translate",
-            json={
-                "q": text,
-                "source": "auto",
-                "target": "en",
-                "format": "text"
-            },
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            return response.json().get("translatedText", text)
-
-        print("LibreTranslate failed, returning original text")
-        return text
-
+        return GoogleTranslator(source="auto", target="en").translate(text)
     except Exception as e:
-        print(f"Translation error: {e}")
+        print(f"Translation error (Deep Translator): {e}")
         return text
-
 
 
 # =========================
@@ -60,20 +40,22 @@ def ensure_columns_exist(conn):
     existing_columns = {row[1] for row in cursor.fetchall()}
 
     new_columns = {
-        'translated_transcript': 'TEXT',
-        'category': 'TEXT',
-        'priority': 'TEXT',
-        'sentiment': 'TEXT',
-        'summary': 'TEXT',
-        'tags': 'TEXT',
-        'department': 'TEXT',
-        'processed_at': 'TEXT',
-        'analysis_json': 'TEXT'
+        "translated_transcript": "TEXT",
+        "category": "TEXT",
+        "priority": "TEXT",
+        "sentiment": "TEXT",
+        "summary": "TEXT",
+        "tags": "TEXT",
+        "department": "TEXT",
+        "processed_at": "TEXT",
+        "analysis_json": "TEXT"
     }
 
     for col_name, col_type in new_columns.items():
         if col_name not in existing_columns:
-            cursor.execute(f"ALTER TABLE grievances ADD COLUMN {col_name} {col_type}")
+            cursor.execute(
+                f"ALTER TABLE grievances ADD COLUMN {col_name} {col_type}"
+            )
             print(f"Added column: {col_name}")
 
     conn.commit()
@@ -141,8 +123,8 @@ Respond strictly in VALID JSON format without markdown:
 def parse_ollama_response(response_text):
     """Extract and parse JSON from Ollama response."""
     try:
-        start = response_text.find('{')
-        end = response_text.rfind('}') + 1
+        start = response_text.find("{")
+        end = response_text.rfind("}") + 1
         if start != -1 and end > start:
             return json.loads(response_text[start:end])
     except Exception as e:
@@ -236,7 +218,7 @@ def process_grievances():
 if __name__ == "__main__":
     print("Grievance Processing System")
     print("=" * 60)
-    print("• Auto-translation")
+    print("• Auto-translation (Deep Translator)")
     print("• Ollama-based analysis")
     print("• SQLite persistence")
     print("=" * 60)
